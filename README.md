@@ -3,10 +3,10 @@
 Install the released package from the public GitHub repository:
 
 ```sh
-pip install "vsemodeli-seo-agent-connector @ git+https://github.com/ogo2/SEO-Agent-Connector.git@v1.1.1"
+pip install "vsemodeli-seo-agent-connector @ git+https://github.com/ogo2/SEO-Agent-Connector.git@v1.1.2"
 ```
 
-For development, omit `@v1.1.1` to install the default branch. Pin a release tag
+For development, omit `@v1.1.2` to install the default branch. Pin a release tag
 in production so deployments are reproducible.
 
 ## One-time Flask integration

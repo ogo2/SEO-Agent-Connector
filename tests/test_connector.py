@@ -44,6 +44,13 @@ def make_token(base, scopes=("articles:read", "articles:write", "articles:publis
 def test_token_hash_scope_revocation_and_admin_auth(live_connector):
     base, connector = live_connector
     assert requests.get(base + "/admin/seo-agent", timeout=3).status_code == 403
+    panel = requests.get(base + "/admin/seo-agent", headers={"X-Test-Admin":"yes"}, timeout=3)
+    assert panel.status_code == 200 and "data-secret-value" in panel.text
+    assert "prefers-color-scheme" in requests.get(base + "/admin/seo-agent/assets/admin.css", timeout=3).text
+    assert "secretValue.textContent=''" in requests.get(base + "/admin/seo-agent/assets/admin.js", timeout=3).text
+    checks = requests.get(base + "/admin/seo-agent/diagnostics", headers={"X-Test-Admin":"yes"}, timeout=3).json()["checks"]
+    assert next(row for row in checks if row["id"] == "publish")["status"] == "success"
+    assert requests.post(base + "/admin/seo-agent/tokens", json={"name":"Blocked","scopes":["articles:read"]}, headers={"X-Test-Admin":"yes"}, timeout=3).status_code == 403
     created = make_token(base, ("articles:read",))
     with connector._db() as db:
         row = db.execute("SELECT digest FROM tokens WHERE id=?", (created["id"],)).fetchone()
@@ -53,6 +60,8 @@ def test_token_hash_scope_revocation_and_admin_auth(live_connector):
     assert requests.post(base + "/api/seo-agent/v1/articles", headers=headers, json={}, timeout=3).status_code == 403
     assert requests.post(base + f"/admin/seo-agent/tokens/{created['id']}/revoke", json={}, headers={"X-Test-Admin":"yes", "X-Requested-With":"SEOAgentConnector"}, timeout=3).status_code == 200
     assert requests.get(base + "/api/seo-agent/v1/health", headers=headers, timeout=3).status_code == 401
+    with connector._db() as db:
+        assert [row[0] for row in db.execute("SELECT action FROM admin_audit ORDER BY id").fetchall()] == ["token_created", "token_revoked"]
 
 
 def test_real_http_article_lifecycle_sanitization_and_idempotency(live_connector):

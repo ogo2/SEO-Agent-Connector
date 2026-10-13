@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import platform
 import re
 import secrets
 import sqlite3
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit, urlencode
 
-from flask import Blueprint, current_app, g, jsonify, redirect, render_template_string, request, session
+from flask import Blueprint, current_app, g, jsonify, redirect, render_template_string, request, session, abort, send_from_directory
 
 SCOPES = {"articles:read", "articles:write", "articles:publish"}
 MAX_BODY = 1_000_000
@@ -182,6 +183,7 @@ class SeoAgentConnector:
                 CREATE TABLE IF NOT EXISTS usage(token_id TEXT NOT NULL, at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS oauth_pending(id TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, state TEXT NOT NULL, challenge TEXT NOT NULL, scopes TEXT NOT NULL, nonce_hash TEXT NOT NULL, expires_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS oauth_codes(code_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, challenge TEXT NOT NULL, scopes TEXT NOT NULL, expires_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, token_id TEXT, created_at TEXT NOT NULL);
             """)
             token_columns = {row[1] for row in db.execute("PRAGMA table_info(tokens)")}
             if "name" not in token_columns:
@@ -259,6 +261,12 @@ class SeoAgentConnector:
                 return view(*a, **kw)
             return guarded
 
+        @bp.get("/admin/seo-agent/assets/<path:filename>")
+        def admin_assets(filename):
+            if filename not in {"admin.css", "admin.js"}:
+                abort(404)
+            return send_from_directory(str(Path(__file__).parent / "static"), filename)
+
         @bp.get("/admin/seo-agent")
         @admin
         def dashboard():
@@ -266,7 +274,38 @@ class SeoAgentConnector:
                 rows = db.execute("SELECT id,name,scopes,created_at,expires_at,revoked_at,last_used_at FROM tokens WHERE site_id=? ORDER BY created_at DESC", (self.config.site_id,)).fetchall()
             tokens = [{**dict(r), "scopes": json.loads(r["scopes"])} for r in rows]
             if request.accept_mimetypes.best == "application/json": return jsonify(status="configured", tokens=tokens)
-            return render_template_string('''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="referrer" content="no-referrer"><meta name="csrf-token" content="{{ csrf|e }}"><title>SEO Agent Connector</title><main style="font:16px system-ui;max-width:850px;margin:3rem auto"><h1>SEO Agent Connector</h1><p>Коннектор сайта <b>{{ site|e }}</b> готов. API-токены и разрешения можно отозвать здесь.</p><h2>Подключения</h2><table><thead><tr><th>Название</th><th>Права</th><th>Создан</th><th>Последнее использование</th><th>Действие</th></tr></thead><tbody>{% for t in tokens %}<tr><td>{{ t.name|e }}</td><td>{{ t.scopes|join(', ')|e }}</td><td>{{ t.created_at|e }}</td><td>{{ t.last_used_at or '—' }}</td><td>{% if not t.revoked_at %}<button data-revoke="{{ t.id|e }}">Отозвать</button>{% else %}Отозван{% endif %}</td></tr>{% else %}<tr><td colspan="5">Подключений пока нет.</td></tr>{% endfor %}</tbody></table><p id="result" role="status"></p><h2>Ручное подключение</h2><form id="create"><label>Название <input name="name" required maxlength="100"></label><fieldset><legend>Права</legend><label><input type="checkbox" name="scopes" value="articles:read" checked> Читать</label><label><input type="checkbox" name="scopes" value="articles:write" checked> Создавать и изменять</label><label><input type="checkbox" name="scopes" value="articles:publish" checked> Публиковать</label></fieldset><button>Создать токен вручную</button></form></main><script>const result=document.querySelector('#result'),csrf=document.querySelector('[name="csrf-token"]').content;document.querySelector('#create').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);const scopes=f.getAll('scopes');if(!scopes.length){result.textContent='Выберите права.';return}const r=await fetch('/admin/seo-agent/tokens',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'SEOAgentConnector','X-CSRF-Token':csrf},body:JSON.stringify({name:f.get('name'),scopes})});const d=await r.json();result.textContent=r.ok?'Скопируйте токен сейчас и сохраните в менеджере секретов: '+d.token:(d.error||'Ошибка')};document.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=async()=>{if(!confirm('Отозвать токен?'))return;await fetch('/admin/seo-agent/tokens/'+encodeURIComponent(b.dataset.revoke)+'/revoke',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'SEOAgentConnector','X-CSRF-Token':csrf},body:'{}'});location.reload()});</script></html>''', site=self.config.site_id, tokens=tokens, csrf=self._csrf_token())
+            template = (Path(__file__).parent / "templates" / "admin.html").read_text(encoding="utf-8")
+            return render_template_string(template, site=self.config.site_id, base_url=request.url_root.rstrip("/"), version=f"1.1.1 (Python {platform.python_version()})")
+
+        @bp.get("/admin/seo-agent/diagnostics")
+        @admin
+        def diagnostics():
+            checks = [
+                {"id": "https", "status": "success" if request.is_secure else "warning", "title": "HTTPS",
+                 "detail": "Запрос защищён HTTPS." if request.is_secure else "Откройте панель через HTTPS; настройте TLS на сайте или доверенном reverse proxy."}
+            ]
+            try:
+                with self._db() as db:
+                    db.execute("SELECT 1").fetchone()
+                import stat
+                private_mode = stat.S_IMODE(os.stat(self.config.token_db_path).st_mode) & 0o077 == 0
+                storage_ok = private_mode and os.access(self.config.token_db_path, os.R_OK | os.W_OK)
+                checks.append({"id": "storage", "status": "success" if storage_ok else "warning", "title": "Хранилище",
+                    "detail": "Закрытая SQLite база доступна." if storage_ok else "Проверьте закрытые права файла базы."})
+            except (sqlite3.Error, OSError):
+                checks.append({"id": "storage", "status": "error", "title": "Хранилище", "detail": "Не удаётся прочитать базу токенов."})
+            repo_ok = all(callable(getattr(self.config.repository, method, None)) for method in ("create_article", "get_article", "update_article", "publish_article"))
+            checks.extend([
+                {"id": "repository", "status": "success" if repo_ok else "error", "title": "Хранилище статей", "detail": "Адаптер статей готов." if repo_ok else "Проверьте адаптер статей."},
+                {"id": "auth", "status": "success" if self.config.admin_authorizer else "error", "title": "Авторизация", "detail": "Вход администратора подтверждён callback сайта." if self.config.admin_authorizer else "Задайте callback администратора."},
+                {"id": "api", "status": "success" if repo_ok and self.config.admin_authorizer else "warning", "title": "API Publishing v1", "detail": "API v1 доступен при наличии токена." if repo_ok and self.config.admin_authorizer else "Настройте авторизацию и адаптер."},
+                {"id": "capabilities", "status": "success" if repo_ok else "error", "title": "Возможности API", "detail": "Черновики и редактирование доступны." if repo_ok else "Проверьте адаптер."},
+                {"id": "publish", "status": "success" if self.config.publish_callback else "warning", "title": "Публикация", "detail": "Обработчик публикации настроен." if self.config.publish_callback else "Публикация не настроена. Подключите callback и публичный рендерер."},
+            ])
+            with self._db() as db:
+                last = db.execute("SELECT MAX(last_used_at) FROM tokens WHERE site_id=?", (self.config.site_id,)).fetchone()[0]
+            return jsonify(site_id=self.config.site_id, version=f"1.1.1 (Python {platform.python_version()})", api_version=1,
+                base_url=request.url_root.rstrip("/"), checks=checks, last_api_at=last)
 
         def oauth_parameters(values):
             client_id = str(values.get("client_id") or "")
@@ -343,7 +382,7 @@ class SeoAgentConnector:
         @admin
         def list_tokens():
             with self._db() as db:
-                rows = db.execute("SELECT id,scopes,created_at,expires_at,revoked_at,last_used_at FROM tokens WHERE site_id=? ORDER BY created_at DESC", (self.config.site_id,)).fetchall()
+                rows = db.execute("SELECT id,name,scopes,created_at,expires_at,revoked_at,last_used_at FROM tokens WHERE site_id=? ORDER BY created_at DESC", (self.config.site_id,)).fetchall()
             return jsonify(tokens=[{**dict(r), "scopes": json.loads(r["scopes"])} for r in rows])
 
         @bp.post("/admin/seo-agent/tokens")
@@ -356,6 +395,9 @@ class SeoAgentConnector:
             scopes = data.get("scopes", [])
             if not isinstance(scopes, list) or not scopes or set(scopes) - SCOPES: return jsonify(error="Invalid scopes"), 400
             expires_at = data.get("expires_at")
+            if str(data.get("expires_in")) in {"30", "90", "365"}:
+                from datetime import timedelta
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=int(data["expires_in"]))).isoformat().replace("+00:00", "Z")
             if expires_at is not None:
                 try:
                     expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
@@ -366,7 +408,8 @@ class SeoAgentConnector:
             token_id = secrets.token_urlsafe(12)
             with self._db() as db:
                 db.execute("INSERT INTO tokens(id,site_id,digest,scopes,created_at,expires_at,revoked_at,last_used_at,name) VALUES(?,?,?,?,?,?,NULL,NULL,?)", (token_id, self.config.site_id, hashlib.sha256(raw.encode()).hexdigest(), json.dumps(sorted(set(scopes))), _now(), expires_at, name))
-            return jsonify(id=token_id, name=name, token=raw, scopes=sorted(set(scopes)), created_at=_now()), 201
+                db.execute("INSERT INTO admin_audit(action,token_id,created_at) VALUES(?,?,?)", ("token_created", token_id, _now()))
+            return jsonify(id=token_id, name=name, token=raw, scopes=sorted(set(scopes)), created_at=_now(), expires_at=expires_at), 201
 
         @bp.post("/admin/seo-agent/tokens/<token_id>/revoke")
         @admin
@@ -374,6 +417,8 @@ class SeoAgentConnector:
             if not self._admin_post_allowed(): return jsonify(error="Same-origin JSON request required"), 403
             with self._db() as db:
                 cur = db.execute("UPDATE tokens SET revoked_at=? WHERE id=? AND site_id=? AND revoked_at IS NULL", (_now(), token_id, self.config.site_id))
+                if cur.rowcount:
+                    db.execute("INSERT INTO admin_audit(action,token_id,created_at) VALUES(?,?,?)", ("token_revoked", token_id, _now()))
             return (jsonify(status="revoked"), 200) if cur.rowcount else (jsonify(error="Token not found"), 404)
 
         def authorized(scope):
