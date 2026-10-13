@@ -304,6 +304,10 @@ class SeoAgentConnector:
                 response.headers["Referrer-Policy"] = "no-referrer"
                 return response
             pending_id, nonce = str(request.form.get("pending_id") or ""), str(request.form.get("nonce") or "")
+            csrf = str(request.form.get("_csrf_token") or "")
+            expected_csrf = str(session.get("_csrf_token") or "")
+            if not csrf or not expected_csrf or not hmac.compare_digest(csrf, expected_csrf):
+                return jsonify(error="Invalid CSRF token"), 400
             with self._db() as db:
                 row = db.execute("SELECT * FROM oauth_pending WHERE id=?", (pending_id,)).fetchone()
                 if not row or row["expires_at"] <= time.time() or not hmac.compare_digest(row["nonce_hash"], hashlib.sha256(nonce.encode()).hexdigest()):

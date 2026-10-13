@@ -154,7 +154,9 @@ def test_browser_pairing_uses_pkce_and_never_exposes_api_token(tmp_path):
     assert consent.status_code == 200 and "Разрешить подключение".encode() in consent.data
     pending_id = re.search(rb'name="pending_id" value="([^"]+)', consent.data).group(1).decode()
     nonce = re.search(rb'name="nonce" value="([^"]+)', consent.data).group(1).decode()
-    approved = client.post("/admin/seo-agent/authorize", data={"pending_id":pending_id, "nonce":nonce, "decision":"approve", **params}, headers=headers)
+    csrf = re.search(rb'name="_csrf_token" value="([^"]+)', consent.data).group(1).decode()
+    assert client.post("/admin/seo-agent/authorize", data={"pending_id":pending_id, "nonce":nonce, "decision":"approve", **params}, headers=headers).status_code == 400
+    approved = client.post("/admin/seo-agent/authorize", data={"pending_id":pending_id, "nonce":nonce, "_csrf_token":csrf, "decision":"approve", **params}, headers=headers)
     query = parse_qs(urlsplit(approved.location).query)
     code = query["code"][0]
     assert query["state"] == [state] and "sac_" not in approved.location
@@ -187,16 +189,18 @@ def test_browser_authorization_denial_and_expired_code(tmp_path):
     consent = client.get("/admin/seo-agent/authorize", query_string=params, headers={"X-Test-Admin":"yes"})
     pending_id = re.search(rb'name="pending_id" value="([^"]+)', consent.data).group(1).decode()
     nonce = re.search(rb'name="nonce" value="([^"]+)', consent.data).group(1).decode()
+    csrf = re.search(rb'name="_csrf_token" value="([^"]+)', consent.data).group(1).decode()
     denied = client.post("/admin/seo-agent/authorize", data={"pending_id":pending_id, "nonce":nonce,
-        "decision":"deny", **params}, headers={"X-Test-Admin":"yes"})
+        "_csrf_token":csrf, "decision":"deny", **params}, headers={"X-Test-Admin":"yes"})
     assert denied.status_code == 303
     assert "access_denied" in denied.location and "state-value-0123456789" in denied.location
 
     approved = client.get("/admin/seo-agent/authorize", query_string={**params, "state":"state-value-9876543210"}, headers={"X-Test-Admin":"yes"})
     pending_id = re.search(rb'name="pending_id" value="([^"]+)', approved.data).group(1).decode()
     nonce = re.search(rb'name="nonce" value="([^"]+)', approved.data).group(1).decode()
+    csrf = re.search(rb'name="_csrf_token" value="([^"]+)', approved.data).group(1).decode()
     granted = client.post("/admin/seo-agent/authorize", data={"pending_id":pending_id, "nonce":nonce,
-        "decision":"approve", **{**params, "state":"state-value-9876543210"}}, headers={"X-Test-Admin":"yes"})
+        "_csrf_token":csrf, "decision":"approve", **{**params, "state":"state-value-9876543210"}}, headers={"X-Test-Admin":"yes"})
     code = parse_qs(urlsplit(granted.location).query)["code"][0]
     with connector._db() as db:
         db.execute("UPDATE oauth_codes SET expires_at=0")
